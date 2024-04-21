@@ -2,15 +2,6 @@ import os
 import time
 
 def generate_md_toc(root_dir):
-    """
-    生成Markdown格式的目录
-
-    Args:
-        root_dir (str): 根目录路径
-
-    Returns:
-        str: Markdown格式的目录
-    """
     toc = ""
     for root, dirs, files in os.walk(root_dir):
         # 忽略.assets结尾的文件夹
@@ -29,7 +20,7 @@ def generate_md_toc(root_dir):
             # 文件名作为小标题，去掉扩展名
             title = os.path.splitext(file)[0]
             # 相对路径
-            relative_path = os.path.relpath(os.path.join(root, file), root_dir)
+            relative_path = os.path.relpath(os.path.join(root, file), root_dir).replace("\\", "/")
             # 添加链接
             toc += f"  - [{title}]({relative_path})"
             # 获取文件上次修改时间
@@ -39,24 +30,13 @@ def generate_md_toc(root_dir):
     return toc
 
 def write_to_readme(toc):
-    """
-    将目录写入README.md文件中
-
-    Args:
-        toc (str): Markdown格式的目录
-    """
     with open("README.md", "w") as f:
         f.write(toc)
 
-def create_readme_if_not_exists():
-    """
-    如果不存在README.md文件，则创建一个空的README.md文件
-    """
-    if not os.path.exists("README.md"):
-        with open("README.md", "w"):
-            pass
+def main():
+    root_dir = "."
+    toc = generate_md_toc(root_dir)
+    write_to_readme(toc)
 
-root_dir = "."
-toc = generate_md_toc(root_dir)
-create_readme_if_not_exists()
-write_to_readme(toc)
+if __name__ == "__main__":
+    main()
