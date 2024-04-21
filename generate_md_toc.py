@@ -20,8 +20,8 @@ def generate_md_toc(root_dir):
         for file in sorted(md_files):
             # 文件名作为小标题，去掉扩展名
             title = os.path.splitext(file)[0]
-            # 相对路径，并进行URL编码
-            relative_path = quote(os.path.relpath(os.path.join(root, file), root_dir))
+            # 相对路径，并进行URL编码，同时将反斜杠替换为斜杠
+            relative_path = quote(os.path.relpath(os.path.join(root, file), root_dir).replace("\\", "/"))
             # 添加链接
             toc += f"  - [{title}](./{relative_path})"
             # 获取文件上次修改时间
@@ -41,3 +41,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+input()
