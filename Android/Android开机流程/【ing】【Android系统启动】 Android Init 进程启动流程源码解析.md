@@ -10,7 +10,8 @@
 ## 代码位置
 
 > 1. system/core/init/main.cpp
-> 2. 
+> 2. system/core/init/first_stage_init.cpp
+> 3. system/core/init/init.cpp
 
 
 
@@ -694,6 +695,21 @@ int SecondStageMain(int argc, char** argv) {
 ```
 
 1. 如果配置为在发生 panic 时重启到 bootloader，则捕获信号并重启（跟上面第一阶段一样）；
+1. 重定向标准输入（stdin）、标准输出（stdout）和标准错误输出（stderr）到 `/dev/null` （***实际上可以理解为丢弃这些打印***）；
+1. 设置内核日志和SELinux日志；
+1. 设置Init进程和它子进程的OOM_ADJ（用来设置进程优先级的参数）；
+1. 查看是否需要加载调试属性以允许在设备解锁时 adb root，如果不需要就卸载debug ramdisk， 避免property service不会被.prop读取；
+1. **PropertyInit**
+1. 卸载第二阶段的资源，如果允许设备解锁的时候 adb root(第5点)，就这个时候卸载debug ramdisk；
+1. **挂载额外的文件系统**
+1. 在第二阶段启动SeLinux；
+1. Epoll
+1. **StartPropertyService**
+1. **SetProperty**
+1. **SetUsbController**
+1. **SetKernelVersion**
+1. GetBuiltinFunctionMap 获取内置的Func
+1. 
 
 
 
@@ -722,3 +738,4 @@ int SecondStageMain(int argc, char** argv) {
 ## 参考
 
 1. https://cs.android.com/android/platform/superproject/+/android14-release:
+1. 
