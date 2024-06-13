@@ -313,7 +313,7 @@ int FirstStageMain(int argc, char** argv) {
             PLOG(FATAL) << "Could not bind mount /first_stage_ramdisk to itself";
         }
         // 切换根文件系统
-        SwitchRoot("/first_stage_ramdisk");
+        SwitchRoot("/;first_stage_ramdisk");
     }
 
     // 进行第一阶段挂载，如果未创建设备节点，则传递false
@@ -361,18 +361,21 @@ int FirstStageMain(int argc, char** argv) {
 
 上面代码的注释部分是原文翻译，部分是自己加上去。可以看到第一阶段做了如下工作：
 
-1. InstallRebootSignalHandlers ： 实际上监听Linux的Signal，当收到这些Signal时，重启Bootloader，如果REBOOT_BOOTLOADER_ON_PANIC不为true，则不会处理；
-2. 设置基本的环境， 如**设置环境变量、挂载基本的文件系统、挂载设备节点、初始化日志**等等，并监听是否出错，如果出错则停止；
-3. 加载内核模块：根据配置**加载内核模块**，可以选择是否并行加载模块，并记录加载模块的数量和时间。
-4. **创建设备节点和启动控制台**：根据配置决定是否在控制台上输出信息，如果配置为在故障时输出信息，则创建设备节点并启动控制台。
-5. 复制 ramdisk 属性文件：如果存在 `/bootimage_ramdisk.prop` 文件，则将其复制到第二阶段用于使用。
-6. 设置调试模式：如果存在 `/force_debuggable` 文件，则设置环境变量 `INIT_FORCE_DEBUGGABLE` 为 `true`，并复制相关属性文件到调试 ramdisk。
-7. 准备切换根文件系统：如果是正常启动，创建 `/first_stage_ramdisk` 目录并准备切换根文件系统。
-8. 进行第一阶段挂载：进行第一阶段的文件系统挂载。
-9. 释放旧的 ramdisk：如果旧的根目录存在且新的根目录设备号与旧的不同，则释放 ramdisk。
-10. 设置初始 AVB 版本：在恢复模式下设置初始 Android Verified Boot (AVB) 版本。
-11. **设置环境变量：记录第一阶段启动时间**。
-12. **执行 SELinux 初始化：设置 SELinux 初始化的路径和参数，并执行 SELinux 初始**化。
+1. 如果配置为在发生panic时重启到bootloader，则安装重启信号处理程序；
+2. **设置环境变量PATH；**
+3. **挂载所需的基本的文件系统，包括 tmpfs、dev、proc、sysfs、selinuxfs等， 并创建文件夹、设置权限、创建节点等， 其他的由rc文件处理；**
+4.  重定向标准打印到dev/null， 初始化内核打印；
+5. <u>**init first stage started!**</u>
+6. 确定启动内核模块的参数， 并启动内核模块（如是否需要控制台、 是否需要并行加载等）， 最后打印耗时 <u>**（LOG(INFO) << "Loaded " << module_count << " kernel modules took " << module_elapse_time.count() << " ms";）；**</u>
+7. 创建设备节点DoCreateDevices；
+8. 启动控制台StartConsole；
+9. 如果"/system/etc/ramdisk/build.prop"存在， 就将将这个文件拷贝到/second_stage_resources；<u>**LOG(INFO) << "Copied ramdisk prop to " << dest;**</u>；
+10. 如果存在"/force_debuggable"，则设置环境变量INIT_FORCE_DEBUGGABLE以供第二阶段init使用；
+11. 如果是正常启动ForceNormalBoot， 则将root目录设为/first_stage_ramdisk；
+12. 进行第一阶段挂载，如果未创建设备节点，则传递false；
+13. 在Recovery模式下设置初始AVB版本；
+14. 记录第一阶段启动时间环境变量**<u>FIRST_STAGE_STARTED_AT</u>**；
+15. **执行/system/bin/init， 参数selinux_setup；**
 
 那么下一步去查看SeLinux的初始化吧。
 
