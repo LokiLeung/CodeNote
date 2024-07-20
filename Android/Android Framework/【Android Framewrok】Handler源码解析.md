@@ -1,4 +1,6 @@
-# Handler源码解析
+# 【Android Framewrok】Handler源码解析
+
+![f6ff46eb9b03a9bcc634739c09bf992](./%E3%80%90Android%20Framewrok%E3%80%91Handler%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90.assets/f6ff46eb9b03a9bcc634739c09bf992.jpg)
 
 > 日期：2023-06-29
 >
@@ -1275,5 +1277,4 @@ FIND_POTENTIAL_LEAKS 字段的作用是用于在 Handler 源码中的一些位�
 因此，如果你希望开启 FIND_POTENTIAL_LEAKS 功能，可以尝试构建和运行带有调试模式的 Android 源代码版本，以便获得潜在内存泄漏的警告信息。然而，在实际的应用程序开发中，我们通常不需要直接操作该字段，而是使用其他工具和方法来检测和解决内存泄漏问题。
 
 （GPT参考回答，答案其实差不多）
-
 
