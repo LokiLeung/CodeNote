@@ -187,6 +187,478 @@ MMU是一个电路模块，置放在CPU和内存中间，主要负责的是虚�
 
 ## 源码一起读
 
+### Binder通信流程
+
+0. IBinder()
+
+Binder是IBinder的实现，先到IBind下看看IBinder的结构和各个接口的定义。
+
+```java
+// 下面是IBinder的Outline，不包含私有字段
+I：  IBinder
+F：  FIRST_CALL_TRANSACTION                  可用于用户命令的第一个交易代码。
+F：  LAST_CALL_TRANSACTION                   可用于用户命令的最后一个交易代码。
+F：  PING_TRANSACTION                        IBinder 协议事务代码：pingBinder()。
+F：  DUMP_TRANSACTION                        IBinder 协议事务代码：dump内部状态。
+F：  SHELL_COMMAND_TRANSACTION               IBinder 协议事务代码：执行 shell 命令。
+F：  INTERFACE_TRANSACTION                   IBinder 协议事务代码：向事务接收方查询其标准接口描述符。
+
+// IBinder 协议事务代码：向目标对象发送一条推文。包裹中的数据旨在传递到与对象关联的共享消息服务；它可以是任何内容，只要不超过 130 个 UTF-8 字符即可
+// 保守地适合常见的消息服务。作为 {@link Build.VERSION_CODES#HONEYCOMB_MR2} 的一部分，所有 Binder 对象都应支持此协议，以便在整个平台上完全集成推文。为了支持较旧的代码，默认实现将推文记录到主日志中，作为在互联网上公开广播的简单模拟。
+// 此外，在完成调度后，对象必须泡一杯茶，将其返回给调用者，并大喊“老兄，好消息！”
+F：  TWEET_TRANSACTION
+
+// IBinder 协议事务代码：异步告知应用调用者喜欢它。应用负责增加和维护自己的喜欢计数器，并可能向用户显示此值以表明应用的质量。这是一个可选命令，应用不需要处理，因此默认实现是不执行任何操作。
+// 没有返回任何响应，系统的任何功能都不会受到它的影响，但它会提高应用的自尊心。
+F：  LIKE_TRANSACTION
+
+// 无注释
+F：  SYSPROPS_TRANSACTION
+
+// 标记为{@link #transact}：这是一个单向调用，这意味着 调用者会立即返回，无需等待被调用者的结果。被调用者。仅适用于调用方和被调用方处于不同进程的情况。
+// 系统为多个单向调用提供了特殊的排序语义 调用时，系统提供了特殊的排序语义：
+// 这些调用将在 这些调用将在另一个进程中以与原始调用相同的顺序逐次派发。 
+// 这些 仍由 IPC 线程池调度，因此可能会在不同的线程上执行
+// 但在前一个调用完成之前，下一个调用不会被分派。 
+// 这种 对于不同 IBinder 对象上的调用，或在不同 IBinder 对象上混合使用单向和非单向调用时，
+// 这种排序是无法保证的。单向调用和非单向调用混合使用时。
+F：  FLAG_ONEWAY
+
+// 标记到 {@link #transact}：请求 Binder 驱动程序清除事务数据。
+// 在 Java 中使用此标志时要非常小心，因为从 Java Parcel 读取的 Java 对象可能很难清除。
+F：  FLAG_CLEAR_BUF
+
+// 无注释
+F：  FLAG_COLLECT_NOTED_APP_OPS
+
+// 对 IPC 大小的限制，使其安全地低于事务缓冲区限制。
+// 这只是一个建议，并不是真正的限制。交易应比这一限制更小。
+F：  MAX_IPC_SIZE
+    
+
+
+// 应对 IPC 大小设置限制（以字节为单位），以使它们安全地保持在事务缓冲区限制以下。
+M：  getSuggestedMaxIpcSizeBytes()
+
+// 获取此binder支持的接口的规范名称。
+M：  getInterfaceDescriptor()
+
+// 检查该对象是否仍然存在。
+// @return 如果托管进程消失，则返回 false，否则返回另一端的 pingBinder() 实现返回的结果（默认情况下始终为 true）。
+M：  pingBinder()
+
+// 检查绑定器所在的进程是否仍处于活动状态。
+// 如果进程未处于活动状态，则返回 false。请注意，如果返回 true，则进程可能在调用返回时已死亡。
+M：  isBinderAlive()
+
+// 尝试检索此 binder 对象的接口的本地实现。 
+// 如果返回空值，则需要实例化一个代理类，以便通过 transact() 方法调用。
+M：  queryLocalInterface(@NonNull String descriptor)
+
+// 将对象的状态打印到给定的数据流中。
+// @param fd 转储要发送到的原始文件描述符。
+// @param args 转储请求的附加参数。
+M：  dump(@NonNull FileDescriptor fd, @Nullable String[] args)
+
+//  与 {@link #dump(FileDescriptor, String[])} 类似，但总是异步执行。 如果对象是本地的，则会创建一个新线程来执行转储。
+//  @param fd 转储要发送到的原始文件描述符。
+//  @param args 转储请求的附加参数。
+M：  dumpAsync(@NonNull FileDescriptor fd, @Nullable String[] args)
+
+// 在此对象上执行 shell 命令。 调用者可以异步执行该命令；
+// 执行完成后必须始终调用 resultReceiver。
+
+// @param in 可读取输入数据流的原始文件描述符。
+// @param out 正常命令信息应写入的原始文件描述符。
+// @param err 命令错误信息应写入的原始文件描述符。
+// @param args 命令行参数。
+// @param shellCallback 在调用者的 shell 中执行操作的可选回调。
+// @param resultReceiver 命令执行完毕后调用的结果代码。
+M：  shellCommand(@Nullable FileDescriptor in, @Nullable FileDescriptor out, @Nullable FileDescriptor err, @NonNull String[] args, @Nullable ShellCallback shellCallback, @NonNull ResultReceiver resultReceiver)
+
+// 获取此 binder 界面的 binder 扩展。
+// 这样就可以定制界面，而无需修改原始界面。
+// 如果没有 binder 扩展名，则返回 null
+M：  getExtension()
+
+// 对对象执行通用操作。
+// @param code 要执行的操作。 它应该是介于 {@link #FIRST_CALL_TRANSACTION} 和 {@link #LAST_CALL_TRANSACTION} 之间的数字。
+// @param data 向目标发送的数据。 不得为空。如果不发送数据，则必须创建一个此处给出的空包裹。
+// @param reply 将从目标接收的数据。 如果对返回值不感兴趣，可以为空。
+// @param flags 附加操作标志。 0 表示普通 RPC，{@link #FLAG_ONEWAY} 表示单向 RPC。
+// @return 返回 {@link Binder#onTransact} 的结果。 
+// 成功的调用一般会返回 true；false 一般表示事务代码未被理解。 
+// 如果单向调用不同的进程，则不应返回 false。 
+// 如果单向调用的是同一进程中的代码（通常是 C++ 或 Rust 实现），则不存在单向语义，仍可返回 false。
+M：  transact(int code, @NonNull Parcel data, @Nullable Parcel reply, int flags)
+
+// 当托管 IBinder 的进程消失时接收回调的接口。
+I：  DeathRecipient
+
+// 当承载 IBinder 的进程消失时调用的函数。
+// 此回调将像任何其他 Binder 事务一样从任何 Binder 线程调用。 如果接收此通知的进程是多线程的，则可能需要同步，因为其他线程可能同时执行。
+// 调用 {@link bindDied} 时，libbinder 中不会持有任何锁。
+// 无需在 bindDied 回调中调用 {@link unlinkToDeath}。
+// Binder 已死亡，因此 {@link unlinkToDeath} 为无操作。
+// 当该 Binder 代理的最后一个本地引用被删除时，它将被取消链接。
+// @param who 已变为无效的 IBinder
+M：  DeathRecipient::binderDied()
+M：  DeathRecipient::binderDied(@NonNull IBinder who)
+
+//  注册收件人，以便在此 binder 消失时接收通知。 如果此Binder对象意外消失（通常是因为其托管进程已被杀死），
+// 那么给定的 {@link DeathRecipient} 的 {@link DeathRecipient#binderDied DeathRecipient.binderDied()} 方法将被调用。
+// 当所有对已链接的 binder 代理的引用都被删除时，它将自动解除链接。
+// 您将只收到远程装订器的死亡通知，因为根据定义，本地装订器不会在您没有死亡的情况下也死亡。
+// 如果目标 IBinder 的进程已经死亡，则 @throws RemoteException。
+// 参见 #unlinkToDeath
+M：  linkToDeath(@NonNull DeathRecipient recipient, int flags)
+
+// 删除之前注册的死亡通知。如果此对象死亡，将不再调用接收者。
+// @return {@code true} 如果 <var>recipient</var> 成功解除链接，
+// 则向您保证其 {@link DeathRecipient#binderDied DeathRecipient.binderDied()} 方法不会被调用；
+// {@code false} 如果目标 IBinder 已死亡，则意味着该方法已被调用（或即将被调用）。
+// @throws java.util.NoSuchElementException 如果给定的 <var>recipient</var> 尚未向 IBinder 注册，
+// 并且 IBinder 仍处于活动状态。请注意，如果 <var>recipient</var> 从未注册，
+// 但 IBinder 已死亡，则不会抛出此异常，而是会收到 false 返回值。
+M：  unlinkToDeath(@NonNull DeathRecipient recipient, int flags)
+```
+
+我把outline里面所有字段和方法的都机翻阅读了一下，但其实主要留意transact、binderdie、linkToDeath等核心方法就可以了。
+
+1. **BinderProxy.transact()**
+
+> frameworks/base/core/java/android/os/BinderProxy.java
+
+> 经过查阅网上资料，客户端平时我们调用跨进程通信方法的时候，拿到的是BinderProxy，并非Binder.class，至于原因，这一点在后面的学习过程中文章补充。
+
+代码解读：
+
+1. 预处理Part1：判断标志位和单向RPC、binder警告线程，如果发生了就警告，然后重置标志位；
+2. 预处理Part2：判断是否需要Trace，如需要就trace；
+3. 预处理Part3：判断是否由listener，如果由listener进行回调；
+4. 预处理Part4：获取AppOpsManager信息，如果由监听，flag添加多一个FLAG_COLLECT_NOTED_APP_OPS；
+5. 重头戏 **调用 transactNative** ， return方法的result；
+6. 最后如果出异常做一些异常处理。
+
+```java
+    /**
+     * Perform a binder transaction on a proxy.
+     * 提供一个binder交易在proxy
+     * @param code The action to perform.  This should
+     * be a number between {@link #FIRST_CALL_TRANSACTION} and
+     * {@link #LAST_CALL_TRANSACTION}.
+     * @param data Marshalled data to send to the target.  Must not be null.
+     * If you are not sending any data, you must create an empty Parcel
+     * that is given here.
+     * @param reply Marshalled data to be received from the target.  May be
+     * null if you are not interested in the return value.
+     * @param flags Additional operation flags.  Either 0 for a normal
+     * RPC, or {@link #FLAG_ONEWAY} for a one-way RPC.
+     *
+     * @return
+     * @throws RemoteException
+     */
+    public boolean transact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+        // 如果data大于800KB，会在system logcat （logcat -b system）中记录的下日志
+        Binder.checkParcel(this, code, data, "Unreasonably large binder buffer");
+
+       	// 标志位先存起来，具体为什么会更快参考https://www.jianshu.com/p/82ffac3b35c9
+        // 预处理Part1：判断标志位和单向RPC、binder警告线程，如果发生了就警告，然后重置标志位
+        boolean warnOnBlocking = mWarnOnBlocking; // Cache it to reduce volatile access. 缓存以减少易失性读取
+
+        if (warnOnBlocking && ((flags & FLAG_ONEWAY) == 0)
+                && Binder.sWarnOnBlockingOnCurrentThread.get()) {
+
+            // For now, avoid spamming the log by disabling after we've logged
+            // about this interface at least once
+            mWarnOnBlocking = false;
+            warnOnBlocking = false;
+
+            if (Build.IS_USERDEBUG || Build.IS_ENG) {
+                // Log this as a WTF on userdebug and eng builds.
+                Log.wtf(Binder.TAG,
+                        "Outgoing transactions from this process must be FLAG_ONEWAY",
+                        new Throwable());
+            } else {
+                Log.w(Binder.TAG,
+                        "Outgoing transactions from this process must be FLAG_ONEWAY",
+                        new Throwable());
+            }
+        }
+
+        // 预处理Part2：判断是否需要Trace，如需要就trace
+        final boolean tracingEnabled = Binder.isStackTrackingEnabled();
+        if (tracingEnabled) {
+            final Throwable tr = new Throwable();
+            Binder.getTransactionTracker().addTrace(tr);
+            StackTraceElement stackTraceElement = tr.getStackTrace()[1];
+            Trace.traceBegin(Trace.TRACE_TAG_ALWAYS,
+                    stackTraceElement.getClassName() + "." + stackTraceElement.getMethodName());
+        }
+
+        // 预处理Part3：判断是否由listener，如果由listener进行回调
+        // Make sure the listener won't change while processing a transaction.
+        // 确保listener在前后处理过程中不会改变
+        final Binder.ProxyTransactListener transactListener = sTransactListener;
+        Object session = null;
+
+        if (transactListener != null) {
+            final int origWorkSourceUid = Binder.getCallingWorkSourceUid();
+            session = transactListener.onTransactStarted(this, code, flags);
+
+            // 允许listener更新UID，如果UID改变，修改头部内容
+            // Allow the listener to update the work source uid. We need to update the request
+            // header if the uid is updated.
+            final int updatedWorkSourceUid = Binder.getCallingWorkSourceUid();
+            if (origWorkSourceUid != updatedWorkSourceUid) {
+                data.replaceCallingWorkSourceUid(updatedWorkSourceUid);
+            }
+        }
+
+        // 预处理Part4：获取AppOpsManager信息，如果由监听，flag添加多一个FLAG_COLLECT_NOTED_APP_OPS
+        // AppOpsManager有两个作用访问控制和track
+        final AppOpsManager.PausedNotedAppOpsCollection prevCollection =
+                AppOpsManager.pauseNotedAppOpsCollection();
+
+        if ((flags & FLAG_ONEWAY) == 0 && AppOpsManager.isListeningForOpNoted()) {
+            flags |= FLAG_COLLECT_NOTED_APP_OPS;
+        }
+
+        try {
+            // 重头戏啦 调用 transactNative ， return方法的result
+            final boolean result = transactNative(code, data, reply, flags);
+
+            if (reply != null && !warnOnBlocking) {
+                reply.addFlags(Parcel.FLAG_IS_REPLY_FROM_BLOCKING_ALLOWED_OBJECT);
+            }
+
+            return result;
+        } finally {
+            // 出异常的时候做的一些处理
+            AppOpsManager.resumeNotedAppOpsCollection(prevCollection);
+
+            if (transactListener != null) {
+                transactListener.onTransactEnded(session);
+            }
+
+            if (tracingEnabled) {
+                Trace.traceEnd(Trace.TRACE_TAG_ALWAYS);
+            }
+        }
+    }
+```
+
+
+
+2. **BinderProxy.transactNative()**
+
+> frameworks/base/core/java/android/os/BinderProxy.java
+
+```java
+    /**
+     * Native implementation of transact() for proxies
+     */
+    public native boolean transactNative(int code, Parcel data, Parcel reply,
+            int flags) throws RemoteException;
+```
+
+是个JNI方法，顺着JNI去找。
+
+3. **android_util_Binder::gBinderProxyMethods、android_util_Binder::android_os_BinderProxy_transact**
+
+> frameworks/base/core/jni/android_util_Binder.cpp
+
+```C++
+// clang-format off
+static const JNINativeMethod gBinderProxyMethods[] = {
+     /* name, signature, funcPtr */
+    {"pingBinder",          "()Z", (void*)android_os_BinderProxy_pingBinder},
+    {"isBinderAlive",       "()Z", (void*)android_os_BinderProxy_isBinderAlive},
+    {"getInterfaceDescriptor", "()Ljava/lang/String;", (void*)android_os_BinderProxy_getInterfaceDescriptor},
+    {"transactNative",      "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z", (void*)android_os_BinderProxy_transact},
+    {"linkToDeathNative",   "(Landroid/os/IBinder$DeathRecipient;I)V", (void*)android_os_BinderProxy_linkToDeath},
+    {"unlinkToDeathNative", "(Landroid/os/IBinder$DeathRecipient;I)Z", (void*)android_os_BinderProxy_unlinkToDeath},
+    {"getNativeFinalizer",  "()J", (void*)android_os_BinderProxy_getNativeFinalizer},
+    {"getExtension",        "()Landroid/os/IBinder;", (void*)android_os_BinderProxy_getExtension},
+};
+
+
+static jboolean android_os_BinderProxy_transact(JNIEnv* env, jobject obj,
+        jint code, jobject dataObj, jobject replyObj, jint flags) // throws RemoteException
+{
+    if (dataObj == NULL) {
+        jniThrowNullPointerException(env, NULL);
+        return JNI_FALSE;
+    }
+
+    Parcel* data = parcelForJavaObject(env, dataObj);
+    if (data == NULL) {
+        return JNI_FALSE;
+    }
+    Parcel* reply = parcelForJavaObject(env, replyObj);
+    if (reply == NULL && replyObj != NULL) {
+        return JNI_FALSE;
+    }
+
+    IBinder* target = getBPNativeData(env, obj)->mObject.get();
+    if (target == NULL) {
+        jniThrowException(env, "java/lang/IllegalStateException", "Binder has been finalized!");
+        return JNI_FALSE;
+    }
+
+    ALOGV("Java code calling transact on %p in Java object %p with code %" PRId32 "\n",
+            target, obj, code);
+
+    // 调用transact方法
+    //printf("Transact from Java code to %p sending: ", target); data->print();
+    status_t err = target->transact(code, *data, reply, flags);
+    //if (reply) printf("Transact from Java code to %p received: ", target); reply->print();
+
+    if (err == NO_ERROR) {
+        return JNI_TRUE;
+    }
+
+    env->CallStaticVoidMethod(gBinderOffsets.mClass, gBinderOffsets.mTransactionCallback, getpid(),
+                              code, flags, err);
+
+    if (err == UNKNOWN_TRANSACTION) {
+        return JNI_FALSE;
+    }
+
+    signalExceptionForError(env, obj, err, true /*canThrowRemoteException*/, data->dataSize());
+    return JNI_FALSE;
+}
+```
+
+对应方法是android_os_BinderProxy_transact，android_os_BinderProxy_transact调用了target->transact(code, *data, reply, flags)；
+
+4. 
+
+> frameworks/native/libs/binder/include/binder/IBinder.h
+
+```C++
+
+```
+
+
+
+2. Binder.onTransact()
+
+*代码注释*
+
+> 默认实现是一个返回 false 的存根。您将需要重写它以执行适当的事务解组。
+> 如果您想调用它，请调用 transact()。
+> 返回结果的实现通常应使用 Parcel#writeNoException() Parcel.writeNoException 和 Parcel#writeException(Exception) Parcel.writeException 将异常传播回调用者。
+> @param code 要执行的操作。这应该是 {@link #FIRST_CALL_TRANSACTION} 和 {@link #LAST_CALL_TRANSACTION} 之间的数字。
+> @param data 从调用者接收的编组数据。
+> @param reply 如果调用者期望返回结果，则应将其编组到这里。
+> @param flags 附加操作标志。对于正常 RPC，为 0；对于单向 RPC，为 {@link #FLAG_ONEWAY}。
+> @return 调用成功时返回 true；返回 false 通常用于表示您不理解事务代码。
+
+这里我们知道：
+
+1. **如果IPC通信发生异常，会在Parcel内部获得异常**；
+2. **binder有两种细分的通信，一种是正常的RPC，另一种是单向RPC**（RPC全称**R**emote **P**rocedure **C**all，远程过程调用，RPC是一种进程间通信的模式，只透露出通信接口，隐藏具体细节），具体RPC方式由flag确定。
+
+```java
+    /**
+     * Default implementation is a stub that returns false. You will want
+     * to override this to do the appropriate unmarshalling of transactions.
+     *
+     * <p>If you want to call this, call transact().
+     *
+     * <p>Implementations that are returning a result should generally use
+     * {@link Parcel#writeNoException() Parcel.writeNoException} and
+     * {@link Parcel#writeException(Exception) Parcel.writeException} to propagate
+     * exceptions back to the caller.
+     *
+     * @param code The action to perform. This should be a number between
+     * {@link #FIRST_CALL_TRANSACTION} and {@link #LAST_CALL_TRANSACTION}.
+     * @param data Marshalled data being received from the caller.
+     * @param reply If the caller is expecting a result back, it should be marshalled
+     * in to here.
+     * @param flags Additional operation flags. Either 0 for a normal
+     * RPC, or {@link #FLAG_ONEWAY} for a one-way RPC.
+     *
+     * @return Return true on a successful call; returning false is generally used to
+     * indicate that you did not understand the transaction code.
+     */
+```
+
+*代码讲解*
+
+操作方式1：INTERFACE_TRANSACTION IBinder 协议事务代码：向事务接收方查询其标准接口描述符。 自定义重写IBinder接口的时候，可以自己定义标准的描述符；
+
+操作方式2：DUMP_TRANSACTION IBinder 协议事务代码：dump内部状态；
+
+操作方式3：SHELL_COMMAND_TRANSACTION IBinder 协议事务代码：执行 shell 命令。
+
+```java
+	protected boolean onTransact(int code, @NonNull Parcel data, @Nullable Parcel reply,
+            int flags) throws RemoteException {
+        if (code == INTERFACE_TRANSACTION) {
+            // 操作方式1：INTERFACE_TRANSACTION IBinder 协议事务代码：向事务接收方查询其标准接口描述符。 自定义重写IBinder接口的时候，可以自己定义标准的描述符
+            reply.writeString(getInterfaceDescriptor());
+            return true;
+        } else if (code == DUMP_TRANSACTION) {
+            // 操作方式2：DUMP_TRANSACTION IBinder 协议事务代码：dump内部状态
+            ParcelFileDescriptor fd = data.readFileDescriptor();
+            String[] args = data.readStringArray();
+            if (fd != null) {
+                try {
+                    dump(fd.getFileDescriptor(), args);
+                } finally {
+                    IoUtils.closeQuietly(fd);
+                }
+            }
+            // Write the StrictMode header.
+            if (reply != null) {
+                reply.writeNoException();
+            } else {
+                StrictMode.clearGatheredViolations();
+            }
+            return true;
+        } else if (code == SHELL_COMMAND_TRANSACTION) {
+            // 操作方式3：SHELL_COMMAND_TRANSACTION IBinder 协议事务代码：执行 shell 命令
+            ParcelFileDescriptor in = data.readFileDescriptor();
+            ParcelFileDescriptor out = data.readFileDescriptor();
+            ParcelFileDescriptor err = data.readFileDescriptor();
+            String[] args = data.readStringArray();
+            ShellCallback shellCallback = ShellCallback.CREATOR.createFromParcel(data);
+            ResultReceiver resultReceiver = ResultReceiver.CREATOR.createFromParcel(data);
+            try {
+                if (out != null) {
+                    shellCommand(in != null ? in.getFileDescriptor() : null,
+                            out.getFileDescriptor(),
+                            err != null ? err.getFileDescriptor() : out.getFileDescriptor(),
+                            args, shellCallback, resultReceiver);
+                }
+            } finally {
+                IoUtils.closeQuietly(in);
+                IoUtils.closeQuietly(out);
+                IoUtils.closeQuietly(err);
+                // Write the StrictMode header.
+                if (reply != null) {
+                    reply.writeNoException();
+                } else {
+                    StrictMode.clearGatheredViolations();
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+```
+
+
+
+*Ibinder操作方式1 获取标准接口描述符*
+
+```java
+```
+
+### ServiceManager与Binder的启动
+
 
 
 
