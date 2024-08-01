@@ -448,7 +448,7 @@ M：  unlinkToDeath(@NonNull DeathRecipient recipient, int flags)
     }
 ```
 
-
+---
 
 2. **BinderProxy.transactNative()**
 
@@ -464,11 +464,17 @@ M：  unlinkToDeath(@NonNull DeathRecipient recipient, int flags)
 
 是个JNI方法，顺着JNI去找。
 
+---
+
 3. **android_util_Binder::gBinderProxyMethods、android_util_Binder::android_os_BinderProxy_transact**
 
 > frameworks/base/core/jni/android_util_Binder.cpp
 
 ```C++
+#include <binder/BpBinder.h>
+
+// ...
+
 // clang-format off
 static const JNINativeMethod gBinderProxyMethods[] = {
      /* name, signature, funcPtr */
@@ -530,19 +536,532 @@ static jboolean android_os_BinderProxy_transact(JNIEnv* env, jobject obj,
 }
 ```
 
-对应方法是android_os_BinderProxy_transact，android_os_BinderProxy_transact调用了target->transact(code, *data, reply, flags)；
+对应方法是android_os_BinderProxy_transact，android_os_BinderProxy_transact调用了target->transact(code, *data, reply, flags)，而在include中，引入的是BpBinder.h，我们进一步到BpBinder.cpp看下； 
 
-4. 
+---
 
-> frameworks/native/libs/binder/include/binder/IBinder.h
+4. **BpBinder::transact**
+
+> frameworks/native/libs/binder/BpBinder.cpp
+
+```C++
+// NOLINTNEXTLINE(google-default-arguments)
+status_t BpBinder::transact(
+    uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
+{
+    // 一旦binder已经挂掉， 永远不会复活
+    // 
+    // Once a binder has died, it will never come back to life.
+    if (mAlive) {
+        // 这里将FLAG_PRIVATE_VENDOR取出来变成布尔变量，然后再从flag移除，因为不允许将用户空间的flag传入kernel
+        bool privateVendor = flags & FLAG_PRIVATE_VENDOR;
+        // don't send userspace flags to the kernel
+        flags = flags & ~static_cast<uint32_t>(FLAG_PRIVATE_VENDOR);
+
+        // 这里检查stability等级（我也不知道用来干什么的，大概意思是需要判断一个稳定性等级，来判断binder的接口）
+        // ************
+        // Stability注释：接口稳定性：
+        // 这是一组特定的 API 调用（writeInt32/readInt32 等特定顺序）随时间变化的方式。
+        // 如果一个版本中有“writeInt32”，而下一个版本中有“writeInt64”，则此接口的稳定性级别就不是非常稳定。
+        // 通常，此顺序由 .aidl 文件控制。
+        // ************
+        // user transactions require a given stability level
+        if (code >= FIRST_CALL_TRANSACTION && code <= LAST_CALL_TRANSACTION) {
+            using android::internal::Stability;
+
+            int16_t stability = Stability::getRepr(this);
+            Stability::Level required = privateVendor ? Stability::VENDOR
+                : Stability::getLocalLevel();
+
+            if (!Stability::check(stability, required)) [[unlikely]] {
+                ALOGE("Cannot do a user transaction on a %s binder (%s) in a %s context.",
+                      Stability::levelString(stability).c_str(),
+                      String8(getInterfaceDescriptor()).c_str(),
+                      Stability::levelString(required).c_str());
+                return BAD_TYPE;
+            }
+        }
+
+        // 如果属于RPCBiner调用到RPC会话的transact方法
+        // 如果不属于RPCBinder，且kEnableKernelIpc开启的话，就调用IPCThreadState::self()->transact；
+        // 这里的[[unlikely]]、[[likely]]是C++20后的一种语法，旨在告诉编译器大概率执行哪个分支，以此进行编译器优化
+        // 国外网站中，一些程序员对这个特性有争议，不过不管怎样，这里binder的代码还是用了
+        // 这里isRpcBinder，如果是RPC通信，则采用socket关联的RPC会话，如果否，则采用/dev/binder
+        status_t status;
+        /**
+         * Return value:
+         * true - this is associated with a socket RpcSession
+         * false - (usual) binder over e.g. /dev/binder
+         */
+        // LIBBINDER_EXPORTED bool isRpcBinder() const;
+        if (isRpcBinder()) [[unlikely]] {
+            status = rpcSession()->transact(sp<IBinder>::fromExisting(this), code, data, reply,
+                                            flags);
+        } else {
+            if constexpr (!kEnableKernelIpc) {
+                LOG_ALWAYS_FATAL("Binder kernel driver disabled at build time");
+                return INVALID_OPERATION;
+            }
+
+            status = IPCThreadState::self()->transact(binderHandle(), code, data, reply, flags);
+        }
+        // 如果dataSize大于300KB，则打印日志
+        if (data.dataSize() > LOG_TRANSACTIONS_OVER_SIZE) {
+            RpcMutexUniqueLock _l(mLock);
+            ALOGW("Large outgoing transaction of %zu bytes, interface descriptor %s, code %d",
+                  data.dataSize(), String8(mDescriptorCache).c_str(), code);
+        }
+
+        // 如果binder通信状态返回的是DEAD_OBJECT，则将mAlive置为0，该binder永远不再正常工作。
+        if (status == DEAD_OBJECT) mAlive = 0;
+
+        return status;
+    }
+
+    return DEAD_OBJECT;
+}
+```
+
+这里注意的点是：
+
+1. 一旦Binder检测过一次DEAD_OBJECT，便不会再回到正常工作中；
+
+   代码中仅有三处对mAlive赋值的地方，其中一处是构造函数时自动注入true，剩余两处均赋值为0，因此此处代码一旦被赋值为0，永远不会再进入正常的逻辑。
+
+   这也是为什么我们常常做服务重连的原因，因为远程服务一旦崩溃，而客户端App不做重连的话，此binder已经失效，无法正常通信，只会返回DEAD_OBJECT；
+
+2. Binder在这里有两种通信方式，一种是RPCBinder，一种是IPCBinder，RPCBinder采用RPCSession，使用socket进行通信；IPCBinder采用/dev/binder进行通信，通常来说是IPCBinder；
+
+3. 超过300KB的binder通信，会被打印出来；
+
+4. binder通信前有个stability稳定性等级检查的机制，这个机制目前网上没有人讲解，注释的大概意思是因为接口经常添加修改等，导致binder不一致，需要一个机制进行检查。举个例子就是开发工作中的AIDL接口，有时候因为业务需求增加了一个接口，那这个在stability这里认为这个是接口的稳定性级别就不是非常稳定；
+
+---
+
+5. **IPCThreadState::self()->transact()**
+
+> frameworks/native/libs/binder/IPCThreadState.cpp
+
+```c++
+
+status_t IPCThreadState::transact(int32_t handle,
+                                  uint32_t code, const Parcel& data,
+                                  Parcel* reply, uint32_t flags)
+{
+    // 如果Parcel是通过RPC建立，但是在这里出现，是个严重错误，Log记录下来
+    LOG_ALWAYS_FATAL_IF(data.isForRpc(), "Parcel constructed for RPC, but being used with binder.");
+
+    status_t err;
+
+    // 加了一个FLAG，没有注释，先看看吧
+    flags |= TF_ACCEPT_FDS;
+
+    // 调试的Log，可以把调试开关打开
+    IF_LOG_TRANSACTIONS() {
+        std::ostringstream logStream;
+        logStream << "BC_TRANSACTION thr " << (void*)pthread_self() << " / hand " << handle
+                  << " / code " << TypeCode(code) << ": \t" << data << "\n";
+        std::string message = logStream.str();
+        ALOGI("%s", message.c_str());
+    }
+
+    // 调试的Log debug等级
+    LOG_ONEWAY(">>>> SEND from pid %d uid %d %s", getpid(), getuid(),
+        (flags & TF_ONE_WAY) == 0 ? "READ REPLY" : "ONE WAY");
+    
+    // 这里是将数据拼接成binder通信协议结构体，然后记录下来这个Parcel
+    err = writeTransactionData(BC_TRANSACTION, flags, handle, code, data, nullptr);
+
+    // 有错误则写入然后返回即可；
+    if (err != NO_ERROR) {
+        if (reply) reply->setError(err);
+        return (mLastError = err);
+    }
+
+    // 如果是ONE_WAY单向Binder,记录下堆栈或者Log等信息
+    if ((flags & TF_ONE_WAY) == 0) {
+        if (mCallRestriction != ProcessState::CallRestriction::NONE) [[unlikely]] {
+            if (mCallRestriction == ProcessState::CallRestriction::ERROR_IF_NOT_ONEWAY) {
+                ALOGE("Process making non-oneway call (code: %u) but is restricted.", code);
+                CallStack::logStack("non-oneway call", CallStack::getCurrent(10).get(),
+                    ANDROID_LOG_ERROR);
+            } else /* FATAL_IF_NOT_ONEWAY */ {
+                LOG_ALWAYS_FATAL("Process may not make non-oneway calls (code: %u).", code);
+            }
+        }
+
+        // 调试的代码 #if 0
+#if 0
+        if (code == 4) { // relayout
+            ALOGI(">>>>>> CALLING transaction 4");
+        } else {
+            ALOGI(">>>>>> CALLING transaction %d", code);
+        }
+#endif
+    
+    	// reply如不为0，等待结果
+        if (reply) {
+            err = waitForResponse(reply);
+        } else {
+            // 如果reply的这个parcel为0， 构造一个然后等待结果
+            Parcel fakeReply;
+            err = waitForResponse(&fakeReply);
+        }
+        
+        // 调试代码， 省略
+        #if 0
+        if (code == 4) { // relayout
+            ALOGI("<<<<<< RETURNING transaction 4");
+        } else {
+            ALOGI("<<<<<< RETURNING transaction %d", code);
+        }
+        #endif
+
+        // 调试日志，可以把开关打开
+        IF_LOG_TRANSACTIONS() {
+            std::ostringstream logStream;
+            logStream << "BR_REPLY thr " << (void*)pthread_self() << " / hand " << handle << ": ";
+            if (reply)
+                logStream << "\t" << *reply << "\n";
+            else
+                logStream << "(none requested)"
+                          << "\n";
+            std::string message = logStream.str();
+            ALOGI("%s", message.c_str());
+        }
+    } else {
+        
+        // 如果不是ONE_WAY单向binder，等待响应结果即可。
+        err = waitForResponse(nullptr, nullptr);
+    }
+
+    return err;
+}
+```
+
+这里的内容其实逻辑不多，主要是
+
+1. 调用`writeTransactionData`方法；
+2. 分别处理ONE_WAY或非ONE_WAY的binder响应结果；
+3. 其他大部分是一些调试日志、调试代码等等；
+
+
+
+6. **IPCThreadState::writeTransactionData()**
+
+> frameworks/native/libs/binder/IPCThreadState.cpp
 
 ```C++
 
+status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
+    int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
+{
+    // 构造了一个结构体，将参数等存储到里面，结构体是binder真正用来通信的数据结构，可以认为是协议
+    binder_transaction_data tr;
+
+    tr.target.ptr = 0; /* Don't pass uninitialized stack data to a remote process */
+    tr.target.handle = handle;
+    tr.code = code;
+    tr.flags = binderFlags;
+    tr.cookie = 0;
+    tr.sender_pid = 0;
+    tr.sender_euid = 0;
+
+    // 获取parcel的错误结果，如果没有错误就继续把相关信息装入tr结构体
+    const status_t err = data.errorCheck();
+    if (err == NO_ERROR) {
+        tr.data_size = data.ipcDataSize();
+        tr.data.ptr.buffer = data.ipcData();
+        tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
+        tr.data.ptr.offsets = data.ipcObjects();
+    } else if (statusBuffer) {
+        // 如果存在错误，并且statusBuffer存在，就装入statusBuffer的内容
+        tr.flags |= TF_STATUS_CODE;
+        *statusBuffer = err;
+        tr.data_size = sizeof(status_t);
+        tr.data.ptr.buffer = reinterpret_cast<uintptr_t>(statusBuffer);
+        tr.offsets_size = 0;
+        tr.data.ptr.offsets = 0;
+    } else {
+        // 否则记录错误并返回
+        return (mLastError = err);
+    }
+
+    // 输出
+    mOut.writeInt32(cmd);
+    mOut.write(&tr, sizeof(tr));
+
+    return NO_ERROR;
+}
+```
+
+这里的逻辑也很简单，就是binder客户端组装协议的过程，构造了一个binder通信的结构体，然后按情况装入内容，中间处理一下parcel的情况，然后输出。
+
+
+
+7. **IPCThreadState::waitForResponse**
+
+根据IPCThreadState::self()->transact()方法里面的逻辑，组装好协议之后就调用这个等待响应的方法了。
+
+```C++
+
+status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
+{
+    uint32_t cmd;
+    int32_t err;
+
+    while (1) {
+        // 核心方法， talkWithDriver 跟驱动层通信
+        // 如果发生错误，跳出循环
+        if ((err=talkWithDriver()) < NO_ERROR) break;
+        // 从mIn里面获取cmd类型
+        err = mIn.errorCheck();
+        if (err < NO_ERROR) break;
+        if (mIn.dataAvail() == 0) continue;
+
+        cmd = (uint32_t)mIn.readInt32();
+
+        // 调试日志
+        IF_LOG_COMMANDS() {
+            std::ostringstream logStream;
+            logStream << "Processing waitForResponse Command: " << getReturnString(cmd) << "\n";
+            std::string message = logStream.str();
+            ALOGI("%s", message.c_str());
+        }
+
+        // 处理各种cmd类型
+        switch (cmd) {
+        case BR_ONEWAY_SPAM_SUSPECT:
+            ALOGE("Process seems to be sending too many oneway calls.");
+            CallStack::logStack("oneway spamming", CallStack::getCurrent().get(),
+                    ANDROID_LOG_ERROR);
+            [[fallthrough]];
+        case BR_TRANSACTION_COMPLETE:
+            if (!reply && !acquireResult) goto finish;
+            break;
+
+        case BR_TRANSACTION_PENDING_FROZEN:
+            ALOGW("Sending oneway calls to frozen process.");
+            goto finish;
+
+        case BR_DEAD_REPLY:
+            err = DEAD_OBJECT;
+            goto finish;
+
+        case BR_FAILED_REPLY:
+            err = FAILED_TRANSACTION;
+            goto finish;
+
+        case BR_FROZEN_REPLY:
+            ALOGW("Transaction failed because process frozen.");
+            err = FAILED_TRANSACTION;
+            goto finish;
+
+        case BR_ACQUIRE_RESULT:
+            {
+                ALOG_ASSERT(acquireResult != NULL, "Unexpected brACQUIRE_RESULT");
+                const int32_t result = mIn.readInt32();
+                if (!acquireResult) continue;
+                *acquireResult = result ? NO_ERROR : INVALID_OPERATION;
+            }
+            goto finish;
+
+        case BR_REPLY:
+            {
+                binder_transaction_data tr;
+                err = mIn.read(&tr, sizeof(tr));
+                ALOG_ASSERT(err == NO_ERROR, "Not enough command data for brREPLY");
+                if (err != NO_ERROR) goto finish;
+
+                if (reply) {
+                    if ((tr.flags & TF_STATUS_CODE) == 0) {
+                        reply->ipcSetDataReference(
+                            reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                            tr.data_size,
+                            reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+                            tr.offsets_size/sizeof(binder_size_t),
+                            freeBuffer);
+                    } else {
+                        err = *reinterpret_cast<const status_t*>(tr.data.ptr.buffer);
+                        freeBuffer(reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                                   tr.data_size,
+                                   reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+                                   tr.offsets_size / sizeof(binder_size_t));
+                    }
+                } else {
+                    freeBuffer(reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer), tr.data_size,
+                               reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+                               tr.offsets_size / sizeof(binder_size_t));
+                    continue;
+                }
+            }
+            goto finish;
+
+        default:
+            err = executeCommand(cmd);
+            if (err != NO_ERROR) goto finish;
+            break;
+        }
+    }
+
+    // 方法内的结束段
+finish:
+    // 如果有错误，保存、记录等等
+    if (err != NO_ERROR) {
+        if (acquireResult) *acquireResult = err;
+        if (reply) reply->setError(err);
+        mLastError = err;
+        logExtendedError();
+    }
+
+    return err;
+}
+```
+
+8. 
+
+```C++
+status_t IPCThreadState::talkWithDriver(bool doReceive)
+{
+    if (mProcess->mDriverFD < 0) {
+        return -EBADF;
+    }
+
+    binder_write_read bwr;
+
+    // Is the read buffer empty?
+    const bool needRead = mIn.dataPosition() >= mIn.dataSize();
+
+    // We don't want to write anything if we are still reading
+    // from data left in the input buffer and the caller
+    // has requested to read the next data.
+    const size_t outAvail = (!doReceive || needRead) ? mOut.dataSize() : 0;
+
+    bwr.write_size = outAvail;
+    bwr.write_buffer = (uintptr_t)mOut.data();
+
+    // This is what we'll read.
+    if (doReceive && needRead) {
+        bwr.read_size = mIn.dataCapacity();
+        bwr.read_buffer = (uintptr_t)mIn.data();
+    } else {
+        bwr.read_size = 0;
+        bwr.read_buffer = 0;
+    }
+
+    IF_LOG_COMMANDS() {
+        std::ostringstream logStream;
+        if (outAvail != 0) {
+            logStream << "Sending commands to driver: ";
+            const void* cmds = (const void*)bwr.write_buffer;
+            const void* end = ((const uint8_t*)cmds) + bwr.write_size;
+            logStream << "\t" << HexDump(cmds, bwr.write_size) << "\n";
+            while (cmds < end) cmds = printCommand(logStream, cmds);
+        }
+        logStream << "Size of receive buffer: " << bwr.read_size << ", needRead: " << needRead
+                  << ", doReceive: " << doReceive << "\n";
+
+        std::string message = logStream.str();
+        ALOGI("%s", message.c_str());
+    }
+
+    // Return immediately if there is nothing to do.
+    if ((bwr.write_size == 0) && (bwr.read_size == 0)) return NO_ERROR;
+
+    bwr.write_consumed = 0;
+    bwr.read_consumed = 0;
+    status_t err;
+    do {
+        IF_LOG_COMMANDS() {
+            std::ostringstream logStream;
+            logStream << "About to read/write, write size = " << mOut.dataSize() << "\n";
+            std::string message = logStream.str();
+            ALOGI("%s", message.c_str());
+        }
+#if defined(__ANDROID__)
+        if (ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr) >= 0)
+            err = NO_ERROR;
+        else
+            err = -errno;
+#else
+        err = INVALID_OPERATION;
+#endif
+        if (mProcess->mDriverFD < 0) {
+            err = -EBADF;
+        }
+        IF_LOG_COMMANDS() {
+            std::ostringstream logStream;
+            logStream << "Finished read/write, write size = " << mOut.dataSize() << "\n";
+            std::string message = logStream.str();
+            ALOGI("%s", message.c_str());
+        }
+    } while (err == -EINTR);
+
+    IF_LOG_COMMANDS() {
+        std::ostringstream logStream;
+        logStream << "Our err: " << (void*)(intptr_t)err
+                  << ", write consumed: " << bwr.write_consumed << " (of " << mOut.dataSize()
+                  << "), read consumed: " << bwr.read_consumed << "\n";
+        std::string message = logStream.str();
+        ALOGI("%s", message.c_str());
+    }
+
+    if (err >= NO_ERROR) {
+        if (bwr.write_consumed > 0) {
+            if (bwr.write_consumed < mOut.dataSize())
+                LOG_ALWAYS_FATAL("Driver did not consume write buffer. "
+                                 "err: %s consumed: %zu of %zu",
+                                 statusToString(err).c_str(),
+                                 (size_t)bwr.write_consumed,
+                                 mOut.dataSize());
+            else {
+                mOut.setDataSize(0);
+                processPostWriteDerefs();
+            }
+        }
+        if (bwr.read_consumed > 0) {
+            mIn.setDataSize(bwr.read_consumed);
+            mIn.setDataPosition(0);
+        }
+        IF_LOG_COMMANDS() {
+            std::ostringstream logStream;
+            logStream << "Remaining data size: " << mOut.dataSize() << "\n";
+            logStream << "Received commands from driver: ";
+            const void* cmds = mIn.data();
+            const void* end = mIn.data() + mIn.dataSize();
+            logStream << "\t" << HexDump(cmds, mIn.dataSize()) << "\n";
+            while (cmds < end) cmds = printReturnCommand(logStream, cmds);
+            std::string message = logStream.str();
+            ALOGI("%s", message.c_str());
+        }
+        return NO_ERROR;
+    }
+
+    ALOGE_IF(mProcess->mDriverFD >= 0,
+             "Driver returned error (%s). This is a bug in either libbinder or the driver. This "
+             "thread's connection to %s will no longer work.",
+             statusToString(err).c_str(), mProcess->mDriverName.c_str());
+    return err;
+}
 ```
 
 
 
-2. Binder.onTransact()
+
+
+
+
+
+
+1. Binder.onTransact()
+
+
+
+
+
+
+
+
 
 *代码注释*
 
